@@ -278,6 +278,30 @@ jobs:
             shelf-${{ matrix.platform }}-ghc-${{ steps.setup.outputs.ghc-version }}-cabal-${{ steps.setup.outputs.cabal-version }}-
             shelf-${{ matrix.platform }}-ghc-${{ steps.setup.outputs.ghc-version }}-cabal-
 
+      # Name the build: what `l4 --version`, `jl4-lsp --version` and the language
+      # server's serverInfo report. legalese/l4-ide's LSP.L4.BuildInfo bakes these
+      # four variables in at compile time (this tree is built fresh, so the
+      # bake is always current); a ref that predates it ignores them. The values
+      # come from the `resolve` job, so all three platforms say the same thing.
+      # The branch is the l4-ide ref that was checked out, passed in: this
+      # workflow's own GITHUB_REF_NAME is the shelf's branch, which is not it,
+      # and the checkout is a detached HEAD. The ref is a branch, a tag or a SHA
+      # ("ref" input), and the slot holds it as it was given: a SHA prints in
+      # full.
+      - name: Name the build
+        env:
+          RELEASE: ${{ needs.resolve.outputs.tag }}
+          BRANCH: ${{ needs.resolve.outputs.ref }}
+          COMMIT: ${{ needs.resolve.outputs.sha }}
+          BUILT_AT: ${{ needs.resolve.outputs.built_at }}
+        run: |
+          {
+            echo "L4_BUILD_RELEASE=${RELEASE}"
+            echo "L4_BUILD_BRANCH=${BRANCH}"
+            echo "L4_BUILD_COMMIT=${COMMIT}"
+            echo "L4_BUILD_DATE=${BUILT_AT%% *}"
+          } >> "$GITHUB_ENV"
+
       - name: Build l4 and jl4-lsp
         run: cabal build exe:l4 exe:jl4-lsp
 
@@ -347,6 +371,10 @@ jobs:
       - name: Smoke-test the staged binaries
         env:
           DIR: ${{ steps.stage.outputs.dir }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          REF: ${{ needs.resolve.outputs.ref }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          BUILT_AT: ${{ needs.resolve.outputs.built_at }}
         run: |
           set -euo pipefail
           L4B="stage/${DIR}/l4${{ matrix.exe }}"
@@ -369,6 +397,31 @@ jobs:
             cat smoke-lsp-help.txt
             exit 1
           }
+
+          # Prove the build names itself. `--version` must print this release's
+          # tag, the l4-ide ref it was built from, the source commit and the
+          # date, which is what the "Name the build" step asked to be baked in: a
+          # binary that says `dev`, or another build's line, or another branch,
+          # must not be published. A ref that predates `--version` answers
+          # "Invalid option" and is let through with a notice. `tr -d '\r'`
+          # because the Windows binaries end their lines with CRLF.
+          WANT="${TAG} (${REF}, ${SHA:0:7}, ${BUILT_AT%% *})"
+          for B in "$L4B" "$LSPB"; do
+            if "$B" --version < /dev/null > smoke-version.txt 2> smoke-version.err; then
+              GOT="$(tr -d '\r' < smoke-version.txt)"
+              if [ "$GOT" != "$WANT" ]; then
+                echo "::error::$B --version printed '$GOT', expected '$WANT'."
+                exit 1
+              fi
+              echo "$(basename "$B") --version: $GOT"
+            elif grep -q 'Invalid option' smoke-version.err; then
+              echo "::notice::$(basename "$B") has no --version: the ref predates it, so the build line is not checked."
+            else
+              echo "::error::$B --version failed:"
+              cat smoke-version.err
+              exit 1
+            fi
+          done
 
       # Archive INSIDE the platform job, not after download:
       # actions/upload-artifact does not preserve the executable bit; a
